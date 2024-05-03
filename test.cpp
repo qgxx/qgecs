@@ -22,26 +22,33 @@ void StartUpSystem(ecs::Commands& command) {
     .Spawn<ID, Name>(ID{ 3 }, Name{ "person3" });
 }
 
-void EchoNameSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources) {
+void EchoNameSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources, ecs::Events& events) {
     for (auto e : queryer.Query<Name>()) {
         std::cout << queryer.Get<Name>(e).name << std::endl;
     }
 }
 
-void EchoIDSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources) {
+void EchoIDSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources, ecs::Events& events) {
     for (auto e : queryer.Query<ID>()) {
         std::cout << queryer.Get<ID>(e).id << std::endl;
     }
+
+    events.Writer<std::string>().Write("From EchoIDSystem()");
 }
 
-void EchoTimerSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources) {
+void EchoTimerSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources, ecs::Events& events) {
     if (resources.Has<Timer>()) {
         auto& timer = resources.Get<Timer>();
         std::cout << timer.time << std::endl;
     }
+
+    auto reader = events.Reader<std::string>();
+    if (reader.Has()) {
+        std::cout << reader.Read() << std::endl;
+    }
 }
 
-void EchoNameAndIDSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources) {
+void EchoNameAndIDSystem(ecs::Commands& command, ecs::Queryer queryer, ecs::Resources resources, ecs::Events& events) {
     for (auto e : queryer.Query<Name, ID>()) {
         std::cout << queryer.Get<ID>(e).id << ", " << queryer.Get<Name>(e).name << std::endl;
     }
@@ -58,6 +65,7 @@ int main() {
 
     world.Startup();
 
+    world.Update();
     world.Update();
 
     world.Shutdown();

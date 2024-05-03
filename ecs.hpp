@@ -23,24 +23,28 @@ struct Component{};
 template <typename T>
 class EventStaging final {
 public:
-    static bool Has() {
-        return data_.has_value();
+    static void Set(const T& t) {
+        event_ = t;
     }
 
-    static void Set(const T& t) {
-        data_ = t;
+    static void Set(T&& t) {
+        event_ = std::move(t);
     }
 
     static T& Get() {
-        return data_.value();
+        return *event_;
+    }
+
+    static bool Has() {
+        return event_ != std::nullopt;
     }
 
     static void Clear() {
-        data_ = std::nullopt;
+        event_ = std::nullopt;
     }
 
 private:
-    inline static std::optional<T> data_ = std::nullopt;
+    inline static std::optional<T> event_ = std::nullopt;
     
 };
 
@@ -54,28 +58,81 @@ public:
     T Read() {
         return EventStaging<T>::Get();
     }
+
+    void Clear() {
+        EventStaging<T>::Clear();
+    }
+};
+
+template <typename T>
+class EventWriter;
+class World;
+
+class Events final {
+public:
+    friend class World; 
+
+    template <typename T>
+    friend class EventWriter;
+
+    template <typename T>
+    auto Reader();
+    
+    template <typename T>
+    auto Writer();
+
+private:
+    std::vector<void(*)(void)> removeEventFuncs_;
+    std::vector<void(*)(void)> removeOldEventFuncs_;
+    std::vector<std::function<void(void)>> addEventFuncs_;
+
+    void addAllEvents() {
+        for (auto func : addEventFuncs_) {
+            func();
+        }
+        addEventFuncs_.clear();
+    }
+
+    void removeOldEvents() {
+        for (auto func : removeOldEventFuncs_) {
+            func();
+        }
+        removeOldEventFuncs_ = removeEventFuncs_;
+        removeEventFuncs_.clear();
+    }
+
 };
 
 template <typename T>
 class EventWriter final {
 public:
-    T Write(const T& t) {
-        EventStaging<T>::Set(t);
-    }
+    EventWriter(Events& e) : events_ { e } {}
+    void Write(const T& t); 
+
+private:
+    Events& events_;
+
 };
 
-class Events final {
-public:
-    template <typename T>
-    EventReader<T> Reader() {
-        return EventReader<T>{};
-    }
-    
-    template <typename T>
-    EventWriter<T> Writer() {
-        return EventWriter<T>{};
-    }
-};
+template <typename T>
+auto Events::Reader() {
+    return EventReader<T>{};
+}
+
+template <typename T>
+auto Events::Writer() {
+    return EventWriter<T>(*this);
+}
+
+template <typename T>
+void EventWriter<T>::Write(const T& t) {
+    events_.addEventFuncs_.push_back([=](){
+        EventStaging<T>::Set(t);
+    });
+    events_.removeEventFuncs_.push_back([](){
+        EventStaging<T>::Clear();
+    });
+}
 
 template <typename Category>
 class IndexGetter final {
@@ -109,7 +166,7 @@ class Commands;
 class Resources;
 class Queryer;
 
-using UpdateSystem = void(*)(Commands&, Queryer, Resources);
+using UpdateSystem = void(*)(Commands&, Queryer, Resources, Events&);
 using StartupSystem = void(*)(Commands&);
 
 class World final {
@@ -216,9 +273,9 @@ private:
     };
 
     std::unordered_map<ComponentID, ResourceInfo> resource_;
-
     std::vector<StartupSystem> startupSystems_;
     std::vector<UpdateSystem> updateSystems_;
+    Events events_;
 };
 
 class Commands final {
@@ -461,8 +518,11 @@ inline void World::Update() {
     std::vector<Commands> commandList;
     for (auto sys : updateSystems_) {
         Commands commands{*this};
-        sys(commands, Queryer{*this}, Resources{*this});
+        sys(commands, Queryer{*this}, Resources{*this}, events_);
+        commandList.push_back(commands);
     }
+    events_.removeOldEvents();
+    events_.addAllEvents();
 
     for (auto& commands : commandList) {
         commands.Execute();
