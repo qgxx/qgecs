@@ -3,9 +3,12 @@
 
 #include "sparse_set.hpp"
 #include <vector>
+#include <iostream>
 #include <algorithm>
 #include <cassert>
 #include <unordered_map>
+#include <optional>
+#include <functional>
 
 #define assertm(msg, expr) assert(((void)(msg), (expr)))
 
@@ -16,6 +19,63 @@ using Entity = uint32_t;
 
 struct Resource{};
 struct Component{};
+
+template <typename T>
+class EventStaging final {
+public:
+    static bool Has() {
+        return data_.has_value();
+    }
+
+    static void Set(const T& t) {
+        data_ = t;
+    }
+
+    static T& Get() {
+        return data_.value();
+    }
+
+    static void Clear() {
+        data_ = std::nullopt;
+    }
+
+private:
+    inline static std::optional<T> data_ = std::nullopt;
+    
+};
+
+template <typename T>
+class EventReader final {
+public:
+    bool Has() {
+        return EventStaging<T>::Has();
+    }
+
+    T Read() {
+        return EventStaging<T>::Get();
+    }
+};
+
+template <typename T>
+class EventWriter final {
+public:
+    T Write(const T& t) {
+        EventStaging<T>::Set(t);
+    }
+};
+
+class Events final {
+public:
+    template <typename T>
+    EventReader<T> Reader() {
+        return EventReader<T>{};
+    }
+    
+    template <typename T>
+    EventWriter<T> Writer() {
+        return EventWriter<T>{};
+    }
+};
 
 template <typename Category>
 class IndexGetter final {
@@ -49,8 +109,8 @@ class Commands;
 class Resources;
 class Queryer;
 
-using UpdateSystem = void(*)(Commands, Queryer, Resources);
-using StartupSystem = void(*)(Commands);
+using UpdateSystem = void(*)(Commands&, Queryer, Resources);
+using StartupSystem = void(*)(Commands&);
 
 class World final {
 public:
@@ -167,27 +227,21 @@ public:
 
     template <typename... ComponentTypes>
     Commands& Spawn(ComponentTypes&&... components) {
-        Entity entity = EntityGenerator::Generator();
-        doSpawn(entity, std::forward<ComponentTypes>(components)...);
+        Spawn_r<ComponentTypes...>(std::forward<ComponentTypes>(components)...);
         return *this;
     }
 
     template <typename... ComponentTypes>
     Entity Spawn_r(ComponentTypes&&... components) {
-        Entity entity = EntityGenerator::Generator();
-        doSpawn(entity, std::forward<ComponentTypes>(components)...);
-        return entity;
+        EntitySpawnInfo info;
+        info.entity = EntityGenerator::Generator();
+        doSpawn(info.entity, info.components, std::forward<ComponentTypes>(components)...);
+        spawnEntities_.push_back(info);
+        return info.entity;
     }
 
     Commands& Destroy(Entity entity) {
-        if (auto it = world_.entities_.find(entity); it != world_.entities_.end()) {
-            for (auto [id, component] : it->second) {
-                auto& componentInfo = world_.componentMap_[id];
-                componentInfo.pool.Destroy(component);
-                componentInfo.sparseSet.remove(entity);
-            }
-            world_.entities_.erase(it);
-        }
+        destroyEntities.push_back(entity);
         return *this;
     }
 
@@ -212,35 +266,98 @@ public:
     template <typename T>
     Commands& RemoveResource() {
         auto index = IndexGetter<Resource>::Get<T>();
-        if (auto it = world_.resource_.find(index); it != world_.resource_.end()) {
-            delete (T*)it->second.resource;
-            it->second.resource = nullptr;
-        }
+        destroyResources_.push_back(ResourceDestroyInfo(index, [](void* elem) { delete (T*)elem; }))
         return *this;
+    }
+
+    void Execute() {
+        for (auto e : destroyEntities) {
+            destroyEntity(e);
+        } 
+        for (auto& info : destroyResources_) {
+            removeResource(info);
+        }
+        for (auto& spawnInfo : spawnEntities_) {
+            auto it = world_.entities_.emplace(spawnInfo.entity, World::ComponentContainer{});
+            for (auto& componentInfo : spawnInfo.components) {
+                it.first->second[componentInfo.index] = doSpawnWithoutType(spawnInfo.entity, componentInfo);
+            }
+        }
     }
 
 private:
     World& world_;
 
-    template <typename T, typename... Remains>
-    void doSpawn(Entity entity, T&& component, Remains&&... remains) {
-        auto index = IndexGetter<Component>::Get<T>();
-        if (auto it = world_.componentMap_.find(index); it == world_.componentMap_.end()) {
-            world_.componentMap_.emplace(index, World::ComponentInfo(
-                []()->void* { return new T; },
-                [](void* elem) { delete (T*)(elem); }
-            ));
-        }
-        World::ComponentInfo& componentInfo = world_.componentMap_[index];
-        void* elem = componentInfo.pool.Create();
-        *((T*)elem) = std::forward<T>(component);
-        componentInfo.sparseSet.add(entity);
+    using DestroyFunc = void(*)(void*);
 
-        auto it = world_.entities_.emplace(entity, World::ComponentContainer{});
-        it.first->second[index] = elem;
+    struct ResourceDestroyInfo {
+        uint32_t index;
+        DestroyFunc destroy;
+
+        ResourceDestroyInfo(uint32_t index, DestroyFunc destroy) : index { index }, destroy { destroy } {}
+    };
+
+    using AssignFunc = std::function<void(void*)>;
+
+    struct ComponentSpawnInfo {
+        AssignFunc assign;
+        World::Pool::CreateFunc create;
+        World::Pool::DestroyFunc destroy;
+        ComponentID index;
+    };
+
+    struct EntitySpawnInfo {
+        Entity entity;
+        std::vector<ComponentSpawnInfo> components;
+    };
+
+    std::vector<Entity> destroyEntities;
+    std::vector<ResourceDestroyInfo> destroyResources_;
+    std::vector<EntitySpawnInfo> spawnEntities_;
+
+    template <typename T, typename... Remains>
+    void doSpawn(Entity entity, std::vector<ComponentSpawnInfo>& spawnInfo, T&& component, Remains&&... remains) {
+        ComponentSpawnInfo info;
+        info.index = IndexGetter<Component>::Get<T>();
+        info.create = [](void)->void* { return new T; };
+        info.destroy = [](void* elem) { delete (T*)(elem); };
+        info.assign = [=](void* elem) {
+            static auto com = component;
+            *((T*)elem) = com;
+        };
+        spawnInfo.push_back(info);
 
         if constexpr (sizeof...(remains) != 0) {
-            doSpawn<Remains...>(entity, std::forward<Remains>(remains)...);
+            doSpawn<Remains...>(entity, spawnInfo, std::forward<Remains...>(remains)...);
+        }
+    }
+
+    void* doSpawnWithoutType(Entity entity, ComponentSpawnInfo& info) {
+        if (auto it = world_.componentMap_.find(info.index); it == world_.componentMap_.end()) {
+            world_.componentMap_.emplace(info.index, World::ComponentInfo(info.create, info.destroy));
+        }
+        World::ComponentInfo& componentInfo = world_.componentMap_[info.index];
+        void* elem = componentInfo.pool.Create();
+        info.assign(elem);
+        componentInfo.sparseSet.add(entity);
+        return elem;
+    }
+    
+    void destroyEntity(Entity entity) {
+        if (auto it = world_.entities_.find(entity); it != world_.entities_.end()) {
+            for (auto [id, component] : it->second) {
+                auto& componentInfo = world_.componentMap_[id];
+                componentInfo.pool.Destroy(component);
+                componentInfo.sparseSet.remove(entity);
+            }
+            world_.entities_.erase(it);
+        }
+    }
+
+    void removeResource(ResourceDestroyInfo& info) {
+        if (auto it = world_.resource_.find(info.index); it != world_.resource_.end()) {
+            info.destroy(it->second.resource);
+            it->second.resource = nullptr;
         }
     }
 };
@@ -328,14 +445,27 @@ private:
 };
 
 inline void World::Startup() {
+    std::vector<Commands> commandList;
     for (auto sys : startupSystems_) {
-        sys(Commands{*this});
+        Commands commands{*this};
+        sys(commands);
+        commandList.push_back(commands);
+    }
+
+    for (auto& commands : commandList) {
+        commands.Execute();
     }
 }
 
 inline void World::Update() {
+    std::vector<Commands> commandList;
     for (auto sys : updateSystems_) {
-        sys(Commands{*this}, Queryer{*this}, Resources{*this});
+        Commands commands{*this};
+        sys(commands, Queryer{*this}, Resources{*this});
+    }
+
+    for (auto& commands : commandList) {
+        commands.Execute();
     }
 }
 
